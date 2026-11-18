@@ -10,7 +10,7 @@ import {
   useTransform,
   type PanInfo,
 } from "framer-motion";
-import { ArrowUp, Heart, Laugh, Undo2, X } from "lucide-react";
+import { Bookmark, Heart, Laugh, SkipForward, Undo2, X } from "lucide-react";
 import {
   deleteSaveAction,
   insertSaveAction,
@@ -18,6 +18,7 @@ import {
 } from "@/app/actions/captions";
 import type { SwipeCaption } from "@/app/actions/captions/fetch-swipe-deck-action";
 import { useToast } from "@/hooks/use-toast";
+import { createWheelGesture } from "./wheel-gesture";
 
 // A vote sends a caption left (not funny) or right (funny).
 type VoteDir = "left" | "right";
@@ -35,18 +36,22 @@ type HistoryEntry = {
 
 const SWIPE_DISTANCE = 100;
 const SWIPE_VELOCITY = 400;
-const DOUBLE_TAP_MS = 300;
-// Two-finger trackpad swipe: how much travel before it counts.
-const WHEEL_THRESHOLD = 60;
-// A pause longer than this between wheel events means fingers lifted, so the
-// next event begins a fresh gesture that is allowed to fire again.
-const WHEEL_GAP_MS = 140;
+// Max gap between the two taps of a double-tap. OS double-click defaults are
+// ~500ms, so anything much tighter misses a lot of real double-taps/clicks.
+const DOUBLE_TAP_MS = 450;
+// After a double-tap the heart pops on the card for this long before the card
+// flies off, so you can see it was saved and not just swiped.
+const DOUBLE_TAP_HOLD_MS = 260;
+const BURST_MS = 900;
 
 const exitVariants = {
   exit: (direction: ExitDir) => ({
     x: direction === "right" ? 1200 : direction === "left" ? -1200 : 0,
     y: direction === "up" ? -1200 : 0,
     opacity: 0,
+    // A card that's leaving must not catch taps or drags meant for the next
+    // one (AnimatePresence keeps it mounted with its old `isTop` props).
+    pointerEvents: "none" as const,
     transition: { duration: 0.35, ease: "easeIn" as const },
   }),
 };
@@ -62,18 +67,35 @@ export default function SwipeDeck({
   const [deck, setDeck] = useState<SwipeCaption[]>(initialDeck);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [exitDirection, setExitDirection] = useState<ExitDir>("right");
-  const [heartBurstId, setHeartBurstId] = useState<string | null>(null);
+  // Short-lived "saved" overlay shown over the stack (not inside a card, so it
+  // still shows while the card it belongs to is flying away).
+  const [burst, setBurst] = useState<string | null>(null);
+  const burstTimer = useRef<number | null>(null);
   const { toast } = useToast();
 
   const topCard = deck[0];
 
+  const flashBurst = useCallback((label: string) => {
+    if (burstTimer.current) window.clearTimeout(burstTimer.current);
+    setBurst(label);
+    burstTimer.current = window.setTimeout(() => setBurst(null), BURST_MS);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (burstTimer.current) window.clearTimeout(burstTimer.current);
+    };
+  }, []);
+
+  // Vote on `card` (defaults to the top card) and remove it from the deck. The
+  // card is removed by id so a delayed call still targets the right one.
   const swipe = useCallback(
-    (direction: VoteDir) => {
-      const card = deck[0];
+    (direction: VoteDir, target?: SwipeCaption) => {
+      const card = target ?? deck[0];
       if (!card) return;
 
       setExitDirection(direction);
-      setDeck((prev) => prev.slice(1));
+      setDeck((prev) => prev.filter((c) => c.id !== card.id));
 
       const request = toggleCaptionVoteAction(
         card.id,
@@ -138,9 +160,8 @@ export default function SwipeDeck({
   }, []);
 
   const save = useCallback(
-    async (card: SwipeCaption) => {
-      setHeartBurstId(card.id);
-      window.setTimeout(() => setHeartBurstId(null), 800);
+    async (card: SwipeCaption, { quiet = false } = {}) => {
+      if (!quiet) flashBurst(card.is_saved ? "Already saved" : "Saved");
       if (card.is_saved) return;
 
       setSaved(card.id, true);
@@ -152,7 +173,7 @@ export default function SwipeDeck({
         toast({ title: "Couldn't save that caption", variant: "destructive" });
       }
     },
-    [setSaved, toast]
+    [flashBurst, setSaved, toast]
   );
 
   const toggleSave = useCallback(
@@ -173,13 +194,15 @@ export default function SwipeDeck({
   );
 
   // Double-click / double-tap: save to Favorites, count it as funny, and move
-  // on to the next caption in one gesture.
+  // on to the next caption in one gesture. The heart pops first, then the card
+  // flies right, so it reads as "saved" rather than a plain funny swipe.
   const favoriteAndFunny = useCallback(
     (card: SwipeCaption) => {
-      void save(card);
-      swipe("right");
+      flashBurst("Saved + Funny");
+      void save(card, { quiet: true });
+      window.setTimeout(() => swipe("right", card), DOUBLE_TAP_HOLD_MS);
     },
-    [save, swipe]
+    [flashBurst, save, swipe]
   );
 
   useEffect(() => {
@@ -228,44 +251,20 @@ export default function SwipeDeck({
     const el = wheelRef.current;
     if (!el) return;
 
-    let accX = 0;
-    let accY = 0;
-    let firedThisGesture = false;
-    let lastEventTime = 0;
+    const gesture = createWheelGesture();
 
     const onWheel = (event: WheelEvent) => {
-      const now = event.timeStamp;
-      if (now - lastEventTime > WHEEL_GAP_MS) {
-        // Fingers lifted since the last event: begin a fresh gesture.
-        accX = 0;
-        accY = 0;
-        firedThisGesture = false;
-      }
-      lastEventTime = now;
-
-      if (firedThisGesture) {
-        event.preventDefault(); // swallow the inertia tail
-        return;
-      }
-
-      accX += event.deltaX;
-      accY += event.deltaY;
-      if (Math.abs(accX) < WHEEL_THRESHOLD && Math.abs(accY) < WHEEL_THRESHOLD) {
-        return;
-      }
-
+      // Capture EVERY wheel over the card so the page never scrolls while you
+      // swipe on the photo. Off the photo this listener isn't attached, so the
+      // rest of the page scrolls normally.
       event.preventDefault();
-      firedThisGesture = true;
+
+      const action = gesture(event);
+      if (!action) return;
       const { swipe: s, skip: sk, goBack: gb } = actionsRef.current;
-      if (Math.abs(accX) > Math.abs(accY)) {
-        // Natural-scroll trackpad: swipe right → deltaX negative.
-        if (accX < 0) s("right");
-        else s("left");
-      } else if (accY > 0) {
-        sk(); // swipe up
-      } else {
-        void gb(); // swipe down
-      }
+      if (action === "right" || action === "left") s(action);
+      else if (action === "up") sk();
+      else void gb();
     };
 
     el.addEventListener("wheel", onWheel, { passive: false });
@@ -299,7 +298,6 @@ export default function SwipeDeck({
                     key={card.id}
                     card={card}
                     isTop={isTop}
-                    showHeart={heartBurstId === card.id}
                     onSwipe={swipe}
                     onSkip={skip}
                     onBack={() => void goBack()}
@@ -309,14 +307,39 @@ export default function SwipeDeck({
               })}
           </AnimatePresence>
         )}
+
+        <AnimatePresence>
+          {burst && (
+            <motion.div
+              key={burst}
+              data-testid="save-burst"
+              className="pointer-events-none absolute inset-0 z-10 flex flex-col
+                items-center justify-center gap-2"
+              initial={{ scale: 0.4, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 1.3, opacity: 0 }}
+              transition={{ type: "spring", stiffness: 500, damping: 26 }}
+            >
+              <Heart
+                className="h-28 w-28 text-white drop-shadow-lg"
+                fill="currentColor"
+              />
+              <span className="bg-black/70 px-3 py-1 text-sm font-semibold
+                tracking-wide text-white">
+                {burst}
+              </span>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
-      <div className="mt-7 flex items-end justify-center gap-2 sm:gap-3">
+      {/* Two big decisions in the middle; small helpers either side. */}
+      <div className="mt-6 flex w-full items-end justify-center gap-3 sm:gap-4">
         <ActionButton
-          label="Back"
+          label="Undo"
           onClick={() => void goBack()}
           disabled={history.length === 0}
-          variant="amber"
+          kind="secondary"
         >
           <Undo2 className="h-5 w-5" />
         </ActionButton>
@@ -324,19 +347,19 @@ export default function SwipeDeck({
           label="Not funny"
           onClick={() => swipe("left")}
           disabled={!topCard}
-          variant="rose"
-          primary
+          kind="primary"
+          tone="rose"
         >
-          <X className="h-7 w-7" strokeWidth={3} />
+          <X className="h-8 w-8" strokeWidth={3} />
         </ActionButton>
         <ActionButton
           label={topCard?.is_saved ? "Saved" : "Save"}
           onClick={() => topCard && void toggleSave(topCard)}
           disabled={!topCard}
-          variant="pink"
+          kind="secondary"
           active={!!topCard?.is_saved}
         >
-          <Heart
+          <Bookmark
             className="h-5 w-5"
             fill={topCard?.is_saved ? "currentColor" : "none"}
           />
@@ -345,33 +368,35 @@ export default function SwipeDeck({
           label="Funny"
           onClick={() => swipe("right")}
           disabled={!topCard}
-          variant="emerald"
-          primary
+          kind="primary"
+          tone="emerald"
         >
-          <Laugh className="h-7 w-7" strokeWidth={2.5} />
+          <Laugh className="h-8 w-8" strokeWidth={2.5} />
         </ActionButton>
         <ActionButton
           label="Skip"
           onClick={() => skip()}
           disabled={!topCard}
-          variant="sky"
+          kind="secondary"
         >
-          <ArrowUp className="h-5 w-5" />
+          <SkipForward className="h-5 w-5" />
         </ActionButton>
       </div>
 
       <p className="mt-6 hidden text-center text-xs leading-relaxed text-muted-foreground sm:block">
-        Swipe, use the buttons, two-finger swipe on a trackpad, or arrow keys:
+        Drag the card, two-finger swipe on a trackpad, or use the arrow keys:
         <br />
         <span className="text-rose-500">←</span> not funny ·{" "}
         <span className="text-emerald-500">→</span> funny ·{" "}
-        <span className="text-sky-500">↑</span> skip ·{" "}
-        <span className="text-amber-500">↓</span> back · double-click = save +
-        funny
+        <span className="text-foreground">↑</span> skip ·{" "}
+        <span className="text-foreground">↓</span> undo ·{" "}
+        <span className="text-foreground">S</span> save
+        <br />
+        Double-click a card to save it <em>and</em> mark it funny.
       </p>
       <p className="mt-6 text-center text-xs leading-relaxed text-muted-foreground sm:hidden">
-        Swipe right if it&apos;s funny, left if not. Swipe up to skip, down to go
-        back. Double-tap to save it and mark it funny.
+        Swipe right if it&apos;s funny, left if not. Swipe up to skip, down to
+        undo. Double-tap a card to save it and mark it funny.
       </p>
     </div>
   );
@@ -380,7 +405,6 @@ export default function SwipeDeck({
 function SwipeCard({
   card,
   isTop,
-  showHeart,
   onSwipe,
   onSkip,
   onBack,
@@ -388,7 +412,6 @@ function SwipeCard({
 }: {
   card: SwipeCaption;
   isTop: boolean;
-  showHeart: boolean;
   onSwipe: (direction: VoteDir) => void;
   onSkip: () => void;
   onBack: () => void;
@@ -401,7 +424,11 @@ function SwipeCard({
   const nopeOpacity = useTransform(x, [-SWIPE_DISTANCE, -20], [1, 0]);
   const skipOpacity = useTransform(y, [-SWIPE_DISTANCE, -20], [1, 0]);
   const backOpacity = useTransform(y, [20, SWIPE_DISTANCE], [0, 1]);
-  const lastTap = useRef(0);
+  const lastPointerDown = useRef(0);
+  // Set once this card has been voted/skipped/double-tapped from a gesture, so
+  // extra taps or a drag during the short hold-before-fly-off are ignored
+  // (a repeat vote on the same caption would toggle it back off).
+  const done = useRef(false);
 
   // Not far enough in any direction: spring the card back to the middle.
   const springBack = () => {
@@ -411,24 +438,39 @@ function SwipeCard({
   };
 
   const handleDragEnd = (_: unknown, info: PanInfo) => {
+    if (done.current) {
+      springBack();
+      return;
+    }
     const { offset, velocity } = info;
-    const horizontal = Math.abs(offset.x) > Math.abs(offset.y);
 
-    if (horizontal) {
-      let direction: VoteDir | null = null;
-      if (offset.x > SWIPE_DISTANCE || velocity.x > SWIPE_VELOCITY) {
-        direction = "right";
-      } else if (offset.x < -SWIPE_DISTANCE || velocity.x < -SWIPE_VELOCITY) {
-        direction = "left";
-      }
+    // Work out which thresholds each axis crossed, independently.
+    const horizontal: VoteDir | null =
+      offset.x > SWIPE_DISTANCE || velocity.x > SWIPE_VELOCITY
+        ? "right"
+        : offset.x < -SWIPE_DISTANCE || velocity.x < -SWIPE_VELOCITY
+          ? "left"
+          : null;
+    const vertical: "up" | "down" | null =
+      offset.y < -SWIPE_DISTANCE || velocity.y < -SWIPE_VELOCITY
+        ? "up"
+        : offset.y > SWIPE_DISTANCE || velocity.y > SWIPE_VELOCITY
+          ? "down"
+          : null;
 
-      if (!direction) {
-        springBack();
-        return;
-      }
+    // If a gesture crosses both axes, the larger movement wins; otherwise take
+    // whichever axis actually crossed. This lets a mostly-vertical swipe still
+    // register even when it drifts a little sideways, instead of springing back.
+    let action: VoteDir | "up" | "down" | null;
+    if (horizontal && vertical) {
+      action = Math.abs(offset.x) >= Math.abs(offset.y) ? horizontal : vertical;
+    } else {
+      action = horizontal ?? vertical;
+    }
 
-      // Far enough: keep the card flying the way it was thrown, then vote.
-      const sign = direction === "right" ? 1 : -1;
+    if (action === "right" || action === "left") {
+      // Keep the card flying the way it was thrown, then vote.
+      const sign = action === "right" ? 1 : -1;
       const throwSpeed = Math.max(Math.abs(velocity.x), 800);
       animate(x, sign * 1000, {
         type: "tween",
@@ -436,12 +478,13 @@ function SwipeCard({
         velocity: sign * throwSpeed,
       });
       animate(y, y.get() + velocity.y * 0.15, { type: "tween", duration: 0.3 });
-      onSwipe(direction);
+      done.current = true;
+      onSwipe(action);
       return;
     }
 
-    // Vertical: up skips the card (it flies off), down goes back a card.
-    if (offset.y < -SWIPE_DISTANCE || velocity.y < -SWIPE_VELOCITY) {
+    if (action === "up") {
+      // Up skips the card (it flies off the top).
       const throwSpeed = Math.max(Math.abs(velocity.y), 800);
       animate(y, -1000, {
         type: "tween",
@@ -449,11 +492,12 @@ function SwipeCard({
         velocity: -throwSpeed,
       });
       animate(x, x.get() + velocity.x * 0.15, { type: "tween", duration: 0.3 });
+      done.current = true;
       onSkip();
       return;
     }
 
-    if (offset.y > SWIPE_DISTANCE || velocity.y > SWIPE_VELOCITY) {
+    if (action === "down") {
       // The current card stays put; the previous card returns on top of it.
       springBack();
       onBack();
@@ -463,14 +507,27 @@ function SwipeCard({
     springBack();
   };
 
-  const handleTap = () => {
+  // Double-tap / double-click to favorite. Framer's drag gesture calls
+  // preventDefault on the pointer stream, which suppresses native dblclick and
+  // makes onTap fire unreliably, so detect it from raw pointerdown events, which
+  // nothing swallows. The ref is per-card, and a card is gone after one swipe,
+  // so two pointerdowns here can only mean a genuine double-tap on this card.
+  const handlePointerDown = (event: React.PointerEvent) => {
+    // Primary button / first finger only: no right-clicks or second fingers.
+    if (done.current || event.button !== 0 || !event.isPrimary) return;
     const now = Date.now();
-    if (now - lastTap.current < DOUBLE_TAP_MS) {
-      lastTap.current = 0;
+    if (now - lastPointerDown.current < DOUBLE_TAP_MS) {
+      lastPointerDown.current = 0;
+      done.current = true;
       onDoubleTap();
     } else {
-      lastTap.current = now;
+      lastPointerDown.current = now;
     }
+  };
+
+  // A press that turns into a drag isn't the first half of a double-tap.
+  const handleDragStart = () => {
+    lastPointerDown.current = 0;
   };
 
   return (
@@ -495,8 +552,10 @@ function SwipeCard({
         drag={isTop}
         dragMomentum={false}
         dragElastic={1}
+        onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onTap={isTop ? handleTap : undefined}
+        onPointerDown={isTop ? handlePointerDown : undefined}
+        data-testid={isTop ? "top-card" : undefined}
         whileDrag={{ cursor: "grabbing", scale: 1.02 }}
       >
         <div className="relative h-full w-full cursor-grab overflow-hidden
@@ -568,106 +627,67 @@ function SwipeCard({
               </motion.div>
             </>
           )}
-
-          <AnimatePresence>
-            {showHeart && (
-              <motion.div
-                className="pointer-events-none absolute inset-0 flex items-center justify-center"
-                initial={{ scale: 0.3, opacity: 0 }}
-                animate={{ scale: 1.1, opacity: 1 }}
-                exit={{ scale: 1.4, opacity: 0 }}
-                transition={{ duration: 0.25 }}
-              >
-                <Heart
-                  className="h-28 w-28 text-white drop-shadow-lg"
-                  fill="currentColor"
-                />
-              </motion.div>
-            )}
-          </AnimatePresence>
         </div>
       </motion.div>
     </motion.div>
   );
 }
 
-type Variant = "rose" | "emerald" | "pink" | "amber" | "sky";
-
-// Soft tinted circle per action; `active` fills it in (used for a saved card).
-const variantStyles: Record<Variant, { base: string; active: string }> = {
-  rose: {
-    base:
-      "bg-rose-50 text-rose-600 ring-rose-200 hover:bg-rose-100 " +
-      "dark:bg-rose-500/10 dark:text-rose-400 dark:ring-rose-500/30 " +
-      "dark:hover:bg-rose-500/20",
-    active: "bg-rose-600 text-white ring-rose-600",
-  },
-  emerald: {
-    base:
-      "bg-emerald-50 text-emerald-600 ring-emerald-200 hover:bg-emerald-100 " +
-      "dark:bg-emerald-500/10 dark:text-emerald-400 dark:ring-emerald-500/30 " +
-      "dark:hover:bg-emerald-500/20",
-    active: "bg-emerald-600 text-white ring-emerald-600",
-  },
-  pink: {
-    base:
-      "bg-pink-50 text-pink-600 ring-pink-200 hover:bg-pink-100 " +
-      "dark:bg-pink-500/10 dark:text-pink-400 dark:ring-pink-500/30 " +
-      "dark:hover:bg-pink-500/20",
-    active: "bg-pink-500 text-white ring-pink-500",
-  },
-  amber: {
-    base:
-      "bg-amber-50 text-amber-600 ring-amber-200 hover:bg-amber-100 " +
-      "dark:bg-amber-500/10 dark:text-amber-400 dark:ring-amber-500/30 " +
-      "dark:hover:bg-amber-500/20",
-    active: "bg-amber-500 text-white ring-amber-500",
-  },
-  sky: {
-    base:
-      "bg-sky-50 text-sky-600 ring-sky-200 hover:bg-sky-100 " +
-      "dark:bg-sky-500/10 dark:text-sky-400 dark:ring-sky-500/30 " +
-      "dark:hover:bg-sky-500/20",
-    active: "bg-sky-500 text-white ring-sky-500",
-  },
-};
+// The app is square-cornered everywhere (globals.css zeroes border-radius), so
+// these are deliberately plain squares: two big solid ones for the vote, three
+// small outlined ones for the helpers.
+const primaryTones = {
+  rose: "bg-rose-500 text-white hover:bg-rose-600 active:bg-rose-700",
+  emerald:
+    "bg-emerald-500 text-white hover:bg-emerald-600 active:bg-emerald-700",
+} as const;
 
 function ActionButton({
   label,
   onClick,
   disabled,
-  variant,
-  primary,
+  kind,
+  tone,
   active,
   children,
 }: {
   label: string;
   onClick: () => void;
   disabled?: boolean;
-  variant: Variant;
-  primary?: boolean;
+  kind: "primary" | "secondary";
+  tone?: keyof typeof primaryTones;
   active?: boolean;
   children: React.ReactNode;
 }) {
-  const sizeClass = primary ? "h-16 w-16" : "h-12 w-12";
-  const styles = variantStyles[variant];
-  const colorClass = active ? styles.active : styles.base;
+  const isPrimary = kind === "primary";
+  const shapeClass = isPrimary
+    ? `h-16 w-16 shadow-md ${primaryTones[tone ?? "emerald"]}`
+    : active
+      ? "h-11 w-11 border border-foreground bg-foreground text-background"
+      : "h-11 w-11 border border-border bg-background text-muted-foreground " +
+        "hover:border-foreground hover:text-foreground";
   return (
-    <div className="flex flex-col items-center gap-2">
+    <div className="flex flex-col items-center gap-1.5">
       <button
         type="button"
         aria-label={label}
         title={label}
         onClick={onClick}
         disabled={disabled}
-        className={`flex items-center justify-center rounded-full ring-1
-          shadow-sm transition hover:scale-105 active:scale-95
-          disabled:opacity-40 disabled:hover:scale-100 ${sizeClass}
-          ${colorClass}`}
+        className={`flex items-center justify-center transition
+          hover:-translate-y-0.5 active:translate-y-0
+          disabled:cursor-not-allowed disabled:opacity-35
+          disabled:hover:translate-y-0 ${shapeClass}`}
       >
         {children}
       </button>
-      <span className="text-[11px] font-medium text-muted-foreground">
+      <span
+        className={`text-[11px] ${
+          isPrimary
+            ? "font-semibold text-foreground"
+            : "font-medium text-muted-foreground"
+        }`}
+      >
         {label}
       </span>
     </div>
