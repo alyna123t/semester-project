@@ -11,8 +11,8 @@
 # Dependencies
 node_modules
 
-# Lock files
-package-lock.json
+# Lock files (package-lock.json IS committed: Vercel and CI need it to install
+# the exact versions that build; `npm ci` refuses to run without it)
 yarn.lock
 pnpm-lock.yaml
 
@@ -54,3 +54,4 @@ next-env.d.ts
 
 IntelliJ
 .idea
+.env*
